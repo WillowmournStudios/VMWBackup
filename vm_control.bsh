@@ -1,0 +1,343 @@
+#!/bin/bash
+
+################################################################################
+## Set some vars...
+DATE=`/bin/date +%Y%m%d%H%M`
+# the DATE below is for manual clones and should generally be 
+# left commented out...
+#DATE=2014112408
+
+# Paths to VM(s) as of Sep 5, 2015
+#/export/VMs/bigsheeva/bigsheeva_B.vmx
+# We need to be mindful of where we land files - is the FS encrypted?
+# types are 'player' for Player and 'ws' for Workstation
+export MACHINETYPE=ws
+export BackupServer=bkserver
+export BackupUser=bkuser
+export ThisServer=`uname -n`
+export RemoteDir=backup
+
+export VMPath='/export/VMs'
+export ClonePath='/export/backup/VMClones'
+export BackupPath='/export/backup/VMBack'
+
+
+################################################################################
+## Check and Set directories...
+
+echo "Checking for "$VMPath""
+if [[ ! -d "$VMPath" ]]; then
+  echo "VM directory doesn't appear to exist?  Cowardly exiting..."
+  exit 1
+fi
+
+echo "Checking for "$ClonePath""
+if [[ ! -d "$ClonePath" ]]; then
+  /bin/mkdir -p "$ClonePath"
+
+  if [[ "$?" -ne "0" ]]; then
+    echo "Failed to find or make "$ClonePath", cowardly exiting..."
+    exit 1
+  fi
+
+  /bin/chmod 700 "$ClonePath"
+  ls -lhd "$ClonePath"
+fi
+
+echo "Checking for "$BackupPath""
+if [[ ! -d "$BackupPath" ]]; then
+  /bin/mkdir -p "$BackupPath"
+
+  if [[ "$?" -ne "0" ]]; then
+    echo "Failed to find or make "$BackupPath", cowardly exiting..."
+    exit 1
+  fi
+
+  /bin/chmod 700 "$BackupPath"
+  ls -lhd "$BackupPath"
+fi
+
+
+################################################################################
+## Functions
+
+usage ()
+{
+        echo ""
+        echo $"Usage:"
+        echo $0 {start|suspend|stop|snapshot|clone|backup|maint VM-directory}"\
+	     1>&2
+        echo "e.g., $0 snapshot zmail"
+        echo ""
+        echo "This may help in determining your choices:"
+        /bin/vmrun -T "$MACHINETYPE" list
+        echo ""
+        exit 2
+}
+
+
+failed_email ()
+{
+        /bin/mailx -s "Auto VM Maintenance Failed on `uname -n`" $EMail\
+	< /dev/null
+        exit 2
+}
+
+
+startVM ()
+{
+      echo "Starting "$VMX"..."
+      if [[ -z `/bin/vmrun -T "$MACHINETYPE" list | /bin/grep "$2"` ]]; then
+        /bin/vmrun -T "$MACHINETYPE" start "$VMPath"/"$2"/"$VMX" nogui
+        /bin/vmrun -T "$MACHINETYPE" list
+        if [[ -z `/bin/vmrun -T "$MACHINETYPE" list | /bin/grep "$2"` ]]; then
+          failed_email
+        fi
+      else
+        echo "Machine already appears to be running?"
+        /bin/vmrun -T "$MACHINETYPE" list
+        failed_email
+      fi
+}
+
+
+stopVM ()
+{
+      echo "Stopping "$VMX"..."
+      /bin/vmrun -T "$MACHINETYPE" stop "$VMPath"/"$2"/"$VMX" soft
+      if [[ ! -z `/bin/vmrun -T "$MACHINETYPE" list | /bin/grep "$2"` ]]; then
+       failed_email
+      fi
+      echo "$VMX appears to be stopped."
+}
+
+
+snapVM ()
+{
+      echo "Creating "$DATE"_"$2"_PoweredDownSnap"
+      /bin/vmrun -T "$MACHINETYPE" snapshot "$VMPath"/"$2"/"$VMX"\
+      "$DATE"_"$2"_PoweredDownSnap
+      echo ""
+      echo "Snapshot list:"
+      /bin/vmrun listSnapshots "$VMPath"/"$2"/"$VMX" | \
+      /bin/grep "$DATE"_"$2"_PoweredDownSnap
+      echo ""
+      if [[ -z `/bin/vmrun listSnapshots "$VMPath"/"$2"/"$VMX" |
+            /bin/grep "$DATE"_"$2"_PoweredDownSnap` ]]; then
+        failed_email
+      fi
+}
+
+
+cloneVM ()
+{
+      echo ""
+      echo "Housekeeping, deleting "$ClonePath"/"$2"/*"
+      /bin/rm -rf "$ClonePath"/"$2"/*
+      echo ""
+
+      echo "This is a list of the snaps for this VM:"
+      /bin/vmrun -T "$MACHINETYPE" listSnapshots /"$VMPath"/"$2"/"$VMX"
+
+      echo ""
+      echo "Using this snap for the clone:"
+      /bin/vmrun -T "$MACHINETYPE" listSnapshots /"$VMPath"/"$2"/"$2".vmx | \
+        /bin/grep -v Total | /bin/tail -1
+
+      echo ""
+      echo "Cloning, this will take a while..."
+      /bin/vmrun -T "$MACHINETYPE" clone "$VMPath"/"$2"/"$VMX" \
+        "$ClonePath"/"$2"/"$2"_"$DATE"_clone.vmx full -snapshot=`/bin/vmrun -T \
+        "$MACHINETYPE" listSnapshots /"$VMPath"/"$2"/"$2".vmx | \
+        /bin/grep -v Total | /bin/tail -1` -cloneName=""$DATE"_"$2"_Clone"
+
+      echo ""
+      ls -lhd "$ClonePath"/"$2"/
+      ls -lhrt "$ClonePath"/"$2"/
+
+      echo ""
+      /bin/vmrun -T "$MACHINETYPE" list
+}
+
+
+archiveVM ()
+{
+        echo ""
+        echo "Creating an archive of the most recent clone..."
+        cd "$ClonePath"/"$2"/
+        /bin/tar cvfz "$BackupPath"/"$DATE"_"$2".tgz .
+
+        if [[ -n `/bin/tar -tzf "$BackupPath"/"$DATE"_"$2".tgz >/dev/null` ]]
+       	then
+          echo "Something is hinky with the archive..."
+          failed_email
+        fi
+        
+        echo "Archive looks good, sending it to "$BackupServer"..."
+	# HERE DOC needs to be left-aligned, sorry.
+        /bin/sftp "$BackupUser"@"$BackupServer" << EoT
+mkdir "$RemoteDir"/"$ThisServer"
+mkdir "$RemoteDir"/"$ThisServer"/"$2"
+cd "$RemoteDir"/"$ThisServer"/"$2"
+put "$BackupPath"/"$DATE"_"$2".tgz
+ls -lha
+EoT
+        echo ""
+        echo "Archive is complete and the local copy, looks usable."
+        exit 0
+}
+
+
+################################################################################
+## Start Main Script
+
+
+echo "Checking arguments"
+if [[ -z "$1" ]] || [[ ! -d "$VMPath"/"$2" ]]; then
+  usage
+fi
+
+
+echo "Looking for VMX"
+VMX=`/bin/find "$VMPath"/"$2"/ -name "*.vmx" | awk -F/ '{ print $NF }'`
+if [[ ! -e "$VMPath"/"$2"/"$VMX" ]]; then
+  echo ""
+  echo "Cannot find the specified machine."
+  usage
+fi
+  
+echo ""
+echo "Operating against "$VMPath"/"$2"/"$VMX""
+echo ""
+
+################################################################################
+## Main Case Section
+
+case "$1" in
+
+    start)
+      startVM $1 $2
+      exit 0
+      ;;
+
+    suspend)
+      /bin/vmrun -T "$MACHINETYPE" suspend "$VMPath"/"$2"/"$VMX" hard
+      if [[ ! -z `/bin/vmrun list | /bin/grep "$2"` ]]; then
+       failed_email
+      fi
+      exit 0
+      ;;
+
+    stop)
+
+      stopVM $1 $2
+      exit 0
+      ;;
+
+    snapshot) 
+      if [[ "$MACHINETYPE" != "ws" ]]; then
+        echo 'Sorry, you cannot snap a Player session; cowardly exiting...'
+        exit 1
+      fi
+
+      echo "Assming that you want a powered-down snapshot..."
+      stopVM $1 $2
+      snapVM $1 $2
+      startVM $1 $2
+      exit 0
+      ;;
+
+    clone)
+      # We can actually effectively clone by stopping the VM and then copying 
+      # the directory.  The xml will probably need edits...  Will need to 
+      # update this at some point for Player...
+      if [[ "$MACHINETYPE" -ne "ws" ]]; then
+        echo 'Sorry, you cannot clone a Player session; cowardly exiting...'
+        exit 1
+      fi
+
+      echo "Assuming that you want a fresh powered-down snap for cloning..."
+      stopVM $1 $2
+      snapVM $1 $2
+      startVM $1 $2
+      cloneVM $1 $2
+      exit 0
+      ;;
+
+    backup) 
+      echo "This is heavily customized for thatonedomain.com."
+      echo "Use this code at your own risk!"
+      echo ""
+      echo "This will offline the VM for potentially a very long time."
+      echo "If this is not what you want, then hit [Ctrl] + [c] on your"
+      echo "keyboard now!"
+      echo ""
+      echo "(sleeping for 10 seconds while you think about that...)"
+      /bin/sleep 10
+      echo ""
+      echo "OK, let the backup commence!"
+      echo ""
+
+      if [[ "$MACHINETYPE" != "ws" ]]; then
+        echo "Looks like you are running VMPlayer"
+        echo "Executing a very clunky backup..."
+        stopVM $1 $2
+
+        echo "Checking for the target path..."
+        if [[ ! -d "$ClonePath"/"$2" ]]; then
+          /bin/mkdir -p "$ClonePath"/"$2"
+          if [[ "$?" -ne "0" ]]; then
+            echo "Failed to find or make backup/clone directory, "
+            echo "cowardly exiting"
+            exit 1
+          /bin/chmod 700 "$ClonePath"/"$2"
+          fi
+        fi
+        echo "Target backup directory is `ls -lhd "$ClonePath"/"$2"`"
+
+        echo "Creating the local backup..."
+        /bin/rsync -avh "$VMPath"/"$2"/. "$ClonePath"/"$2"/
+
+        startVM $1 $2
+        archiveVM $1 $2
+
+      else
+        # Workstation code goes here.
+        echo "Backing-up "$2"..."
+        stopVM $1 $2
+        snapVM $1 $2
+        startVM $1 $2
+        cloneVM $1 $2
+        archiveVM $1 $2
+      fi
+      
+      exit 0
+      ;;
+
+    archive)
+      echo ""
+      archiveVM $1 $2
+      exit 0 
+      ;;
+
+    maint) 
+      echo "this code, if complete, would rotate snapshots..."
+      exit 0
+      if [[ `/bin/vmrun listSnapshots /"$VMPath"/"$2"/"$2".vmx | \
+	    /bin/grep -v Total | /bin/wc -l` -gt "6" ]]; then
+         /bin/vmrun deleteSnapshot "$VMPath"/"$2"/"$2".vmx \
+         `/bin/vmrun listSnapshots /"$VMPath"/"$2"/"$2".vmx |\
+         /bin/grep -v Total | /bin/head -1` 
+      else
+         echo ""
+         echo "Too few snapshots, not deleting anything..."
+         echo ""
+      fi
+      exit 0
+      ;;
+    
+    *) usage 
+       ;;
+esac
+
+exit 0
